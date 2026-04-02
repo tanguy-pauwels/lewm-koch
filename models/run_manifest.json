@@ -1,0 +1,22 @@
+{
+  "created_at_utc": "2026-03-31T14:35:33.669196+00:00",
+  "dataset_repo_id": "Tpauwels/lerobot-hdf5-koch_pick_place_1_lego",
+  "dataset_files": [
+    "/workspace/data/train__observation_images_laptop.h5"
+  ],
+  "hydra_overrides": [
+    "data=train__observation_images_laptop",
+    "subdir=lewm-koch-20260331-143533",
+    "output_model_name=lewm",
+    "loader.batch_size=128",
+    "loader.num_workers=6",
+    "trainer.precision=bf16",
+    "wandb.enabled=true",
+    "wandb.config.entity=pauwelstanguy-pha-sto",
+    "wandb.config.project=le-wm-koch",
+    "wandb.config.name=lewm-runpod-run-1",
+    "wandb.config.id=lewm-koch-20260331-143533",
+    "wandb.config.resume=allow"
+  ],
+  "stablewm_home": "/workspace/data"
+}

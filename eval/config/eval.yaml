@@ -1,0 +1,73 @@
+defaults:
+  - _self_
+
+checkpoint:
+  # Optional HF model repo for fallback download, e.g. user/lewm-koch-checkpoints
+  repo_id: null
+  run_id: lewm-koch-eval
+  # Optional explicit path to a local object checkpoint (.ckpt).
+  path: null
+  local_dir: ${oc.env:STABLEWM_HOME,${hydra:runtime.cwd}/data}
+  filename_pattern: "*_object.ckpt"
+
+dataset:
+  name: train__observation_images_laptop
+  cache_dir: ${oc.env:STABLEWM_HOME,${hydra:runtime.cwd}/data}
+  frameskip: 5
+  history_size: 3
+  num_preds: 1
+  img_size: 224
+  keys_to_load:
+    - pixels
+    - action
+    - proprio
+    - state
+    - episode_idx
+    - step_idx
+  keys_to_cache:
+    - action
+    - proprio
+    - state
+    - episode_idx
+    - step_idx
+
+extraction:
+  num_episodes: 12
+  max_windows: 3000
+  batch_size: 32
+  num_workers: 0
+  log_every_batches: 10
+  device: auto
+  seed: 42
+
+projection:
+  tsne:
+    max_points: 3000
+    perplexity: 30.0
+    learning_rate: 200.0
+    n_iter: 1000
+    early_exaggeration: 12.0
+    init: pca
+
+neighbors:
+  k: 5
+  num_anchors: 25
+
+probe:
+  test_size: 0.2
+  ridge_alpha: 1.0
+
+viz:
+  dpi: 140
+  trajectories:
+    num_episodes_plot: 6
+
+output:
+  artifact_root: ${hydra:runtime.cwd}/eval_artifacts
+  run_id: ${checkpoint.run_id}
+  save_extraction_table: false
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
