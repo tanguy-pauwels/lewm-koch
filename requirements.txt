@@ -1,0 +1,12 @@
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+torch==2.2.1
+torchvision==0.17.1
+numpy==1.26.4
+transformers==4.50.0
+
+stable-worldmodel[train]==0.0.6
+hf_transfer
+huggingface_hub
+python-dotenv
+wandb
