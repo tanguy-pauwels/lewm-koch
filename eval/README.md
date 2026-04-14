@@ -1,23 +1,23 @@
 # Eval Module (Latent-First)
 
-Ce module ajoute une pipeline d'evaluation **separee du training** pour analyser les latents JEPA sur KOCH.
+This module adds an evaluation pipeline **separate from training** to analyze JEPA latents on KOCH.
 
-## Installation des dependances eval
+## Install evaluation dependencies
 
-Le training reste pilote par `requirements.txt`.
-Pour l'eval, installe les dependances dediees:
+Training remains driven by `requirements.txt`.
+For eval, install the dedicated dependencies:
 
 ```bash
 python -m pip install -r requirements-eval.txt
 ```
 
-Note:
-- Python 3.10/3.11 utilise `torch==2.2.1` (parite training).
-- Python 3.12/3.13 utilise automatiquement une serie plus recente compatible.
+Notes:
+- Python 3.10/3.11 uses `torch==2.2.1` (training parity).
+- Python 3.12/3.13 automatically uses a newer compatible series.
 
-## Lancer l'evaluation
+## Run evaluation
 
-Depuis la racine du repo:
+From the repository root:
 
 ```bash
 python eval/main.py \
@@ -26,7 +26,7 @@ python eval/main.py \
   dataset.name=train__observation_images_laptop
 ```
 
-Option explicite si le checkpoint n'est pas range sous `<local_dir>/<run_id>/`:
+Explicit option when checkpoint is not stored under `<local_dir>/<run_id>/`:
 
 ```bash
 python eval/main.py \
@@ -34,9 +34,9 @@ python eval/main.py \
   dataset.name=train__observation_images_laptop
 ```
 
-### Avec fallback Hugging Face
+### With Hugging Face fallback
 
-Si le checkpoint n'est pas present localement, le script peut le telecharger:
+If checkpoint is not available locally, the script can download it:
 
 ```bash
 HF_TOKEN=hf_xxx python eval/main.py \
@@ -44,17 +44,17 @@ HF_TOKEN=hf_xxx python eval/main.py \
   checkpoint.run_id=<RUN_SUBDIR>
 ```
 
-Le script cherche un fichier `_object.ckpt` sous `<run_id>/` et choisit automatiquement le plus recent (epoch la plus elevee).
+The script looks for an `_object.ckpt` file under `<run_id>/` and automatically picks the most recent one (highest epoch).
 
-## Sorties
+## Outputs
 
-Les artefacts sont ecrits dans:
+Artifacts are written to:
 
 ```text
 eval_artifacts/<run_id>/
 ```
 
-avec notamment:
+including:
 
 - `latent_pca.csv`
 - `latent_tsne.csv`
@@ -63,7 +63,7 @@ avec notamment:
 - `figures/*.png`
 - `report.md`
 
-## Parametres Hydra principaux
+## Main Hydra parameters
 
 - `checkpoint.repo_id`, `checkpoint.run_id`, `checkpoint.local_dir`, `checkpoint.filename_pattern`
 - `dataset.name`, `dataset.cache_dir`, `dataset.frameskip`, `dataset.history_size`, `dataset.num_preds`
