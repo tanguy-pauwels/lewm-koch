@@ -5,15 +5,90 @@ from pathlib import Path
 import sitecustomize  # noqa: F401
 import hydra
 import lightning as pl
+import numpy as np
 import stable_pretraining as spt
 import stable_worldmodel as swm
 import torch
+from torch.utils.data import ConcatDataset, Dataset
 from lightning.pytorch.loggers import WandbLogger
-from omegaconf import OmegaConf, open_dict
+from omegaconf import ListConfig, OmegaConf, open_dict
 
 from jepa import JEPA
 from module import ARPredictor, Embedder, MLP, SIGReg
-from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
+from utils import HFCheckpointSyncCallback, ModelObjectCallBack, get_column_normalizer, get_img_preprocessor
+
+
+class EpisodeShuffledConcatDataset(Dataset):
+    """Concatenate datasets and shuffle at episode granularity."""
+
+    def __init__(self, datasets: list[swm.data.HDF5Dataset], seed: int):
+        super().__init__()
+        self.concat = ConcatDataset(datasets)
+        episode_groups = []
+        offset = 0
+        for dataset in datasets:
+            grouped = {}
+            for local_idx, (episode_idx, _) in enumerate(dataset.clip_indices):
+                grouped.setdefault(int(episode_idx), []).append(offset + local_idx)
+            episode_groups.extend(grouped.values())
+            offset += len(dataset)
+
+        generator = torch.Generator().manual_seed(seed)
+        permutation = torch.randperm(len(episode_groups), generator=generator).tolist()
+        self.indices = [sample_idx for group_idx in permutation for sample_idx in episode_groups[group_idx]]
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        return self.concat[self.indices[idx]]
+
+
+def _dataset_names_from_cfg(name_field) -> list[str]:
+    if isinstance(name_field, ListConfig):
+        return [str(item) for item in name_field]
+    if isinstance(name_field, (list, tuple)):
+        return [str(item) for item in name_field]
+    return [str(name_field)]
+
+
+def _check_dataset_compatibility(datasets: list[swm.data.HDF5Dataset], keys_to_load: list[str]) -> None:
+    if not datasets:
+        raise ValueError('No dataset provided.')
+    reference_keys = set(datasets[0].column_names)
+    for idx, dataset in enumerate(datasets[1:], start=1):
+        current_keys = set(dataset.column_names)
+        if current_keys != reference_keys:
+            raise ValueError(f'Dataset schema mismatch at index {idx}: {current_keys} vs {reference_keys}')
+    for key in keys_to_load:
+        if key.startswith('pixels'):
+            continue
+        reference_dim = datasets[0].get_dim(key)
+        for idx, dataset in enumerate(datasets[1:], start=1):
+            if dataset.get_dim(key) != reference_dim:
+                raise ValueError(
+                    f'Dataset dim mismatch for key={key!r}: dataset 0 has {reference_dim}, dataset {idx} has {dataset.get_dim(key)}'
+                )
+
+
+def _get_column_normalizer_for_datasets(
+    datasets: list[swm.data.HDF5Dataset],
+    source: str,
+    target: str,
+):
+    if len(datasets) == 1:
+        return get_column_normalizer(datasets[0], source, target)
+
+    merged = np.concatenate([dataset.get_col_data(source) for dataset in datasets], axis=0)
+    data = torch.from_numpy(np.array(merged))
+    data = data[~torch.isnan(data).any(dim=1)]
+    mean = data.mean(0, keepdim=True).clone()
+    std = data.std(0, keepdim=True).clone()
+
+    def norm_fn(x):
+        return ((x - mean) / std).float()
+
+    return spt.data.transforms.WrapTorchTransform(norm_fn, source=source, target=target)
 
 
 def lejepa_forward(self, batch, stage, cfg):
@@ -52,7 +127,16 @@ def run(cfg):
     ##       dataset       ##
     #########################
 
-    dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=None)
+    dataset_cfg = dict(cfg.data.dataset)
+    dataset_names = _dataset_names_from_cfg(dataset_cfg.pop('name'))
+    datasets = [
+        swm.data.HDF5Dataset(name=dataset_name, transform=None, **dataset_cfg)
+        for dataset_name in dataset_names
+    ]
+    _check_dataset_compatibility(datasets, list(cfg.data.dataset.keys_to_load))
+    dataset = datasets[0] if len(datasets) == 1 else EpisodeShuffledConcatDataset(datasets, seed=cfg.seed)
+    print(f'[data] training datasets: {dataset_names}', flush=True)
+
     transforms = [get_img_preprocessor(source='pixels', target='pixels', img_size=cfg.img_size)]
     
     with open_dict(cfg):
@@ -60,13 +144,19 @@ def run(cfg):
             if col.startswith("pixels"):
                 continue
 
-            normalizer = get_column_normalizer(dataset, col, col)
+            normalizer = _get_column_normalizer_for_datasets(datasets, col, col)
             transforms.append(normalizer)
 
-            setattr(cfg.wm, f"{col}_dim", dataset.get_dim(col))
+            setattr(cfg.wm, f"{col}_dim", datasets[0].get_dim(col))
 
     transform = spt.data.transforms.Compose(*transforms)
-    dataset.transform = transform
+    if len(datasets) == 1:
+        dataset.transform = transform
+    else:
+        # In merged mode, apply transforms inside each HDF5Dataset _before_
+        # the base Dataset reshapes action to (num_steps, frameskip * action_dim).
+        for base_dataset in datasets:
+            base_dataset.transform = transform
 
     rnd_gen = torch.Generator().manual_seed(cfg.seed)
     train_set, val_set = spt.data.random_split(
@@ -158,12 +248,34 @@ def run(cfg):
         OmegaConf.save(cfg, f)
 
     object_dump_callback = ModelObjectCallBack(
-        dirpath=run_dir, filename=cfg.output_model_name, epoch_interval=1,
+        dirpath=run_dir,
+        filename=cfg.output_model_name,
+        epoch_interval=int(cfg.checkpoint.object_epoch_interval),
     )
+    callbacks = [object_dump_callback]
+
+    push_on_eval = os.getenv('LEWM_PUSH_CHECKPOINT_ON_EVAL', 'true').strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    output_repo_id = os.getenv('HF_OUTPUT_REPO_ID')
+    hf_token = os.getenv('HF_TOKEN') or os.getenv('HUGGINGFACE_HUB_TOKEN')
+    if push_on_eval and output_repo_id and hf_token:
+        callbacks.append(
+            HFCheckpointSyncCallback(
+                dirpath=run_dir,
+                filename=cfg.output_model_name,
+                run_subdir=run_id,
+                repo_id=output_repo_id,
+                token=hf_token,
+                private_repo=os.getenv('HF_OUTPUT_PRIVATE', 'true').strip().lower() in {'1', 'true', 'yes', 'y', 'on'},
+                layout=os.getenv('LEWM_HF_CHECKPOINT_LAYOUT', 'transformers'),
+                push_on_eval=True,
+            )
+        )
+    elif push_on_eval:
+        print('[sync-eval] disabled: set HF_OUTPUT_REPO_ID and HF_TOKEN to enable upload on eval.', flush=True)
 
     trainer = pl.Trainer(
         **cfg.trainer,
-        callbacks=[object_dump_callback],
+        callbacks=callbacks,
         num_sanity_val_steps=1,
         logger=logger,
         enable_checkpointing=True,

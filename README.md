@@ -83,10 +83,11 @@ docker run --rm \
 
 Ce que fait cette commande:
 - télécharge les `.h5` depuis `HF_DATASET_REPO_ID` dans `STABLEWM_HOME`
-- génère `src/config/train/data/train__observation_images_laptop.yaml`
-- lance `python src/train.py ... loader.batch_size=64 trainer.precision=bf16`
+- génère `src/config/train/data/train__observation_images_merged.yaml` (si multi-datasets activé)
+- lance `python src/train.py ... loader.batch_size=256 trainer.precision=bf16`
+- retombe automatiquement sur un profil de secours (`batch_size`, `num_workers`, `prefetch_factor`) si OOM CUDA ou process tué (`exit -9` / SIGKILL)
 - écrit les artefacts dans `STABLEWM_HOME/<RUN_SUBDIR>`
-- pousse les artefacts sur `HF_OUTPUT_REPO_ID` si configuré
+- pousse les checkpoints à chaque éval dans `HF_OUTPUT_REPO_ID` sous des dossiers `checkpoint-*`
 
 ## Commandes utiles
 
@@ -238,18 +239,29 @@ Important:
 | `STABLEWM_HOME` | non | Dossier local contenant les `.h5` et les sorties de run | `/workspace/data` |
 | `RUN_SUBDIR` | non | Sous-dossier du run. Si vide, généré automatiquement | `lewm-koch-20260331-120000` |
 | `LEWM_OUTPUT_MODEL_NAME` | non | Préfixe des checkpoints générés par `src/train.py` | `lewm` |
-| `LEWM_BATCH_SIZE` | non | Override Hydra `loader.batch_size` | `64` |
+| `LEWM_BATCH_SIZE` | non | Batch cible initial (essai 1) | `256` |
+| `LEWM_BATCH_SIZE_FALLBACK` | non | Batch de fallback si OOM CUDA ou kill process (`-9`) | `128` |
 | `LEWM_PRECISION` | non | Override Hydra `trainer.precision` | `bf16` |
-| `LEWM_NUM_WORKERS` | non | Override Hydra `loader.num_workers` | `16` |
+| `LEWM_NUM_WORKERS` | non | Override Hydra `loader.num_workers` | `8` |
+| `LEWM_LOADER_PREFETCH_FACTOR` | non | Override Hydra `loader.prefetch_factor` | `2` |
+| `LEWM_LOADER_PERSISTENT_WORKERS` | non | Override Hydra `loader.persistent_workers` | `true` |
+| `LEWM_FALLBACK_NUM_WORKERS` | non | `loader.num_workers` du profil fallback | `2` |
+| `LEWM_FALLBACK_PREFETCH_FACTOR` | non | `loader.prefetch_factor` du profil fallback | `1` |
+| `LEWM_FALLBACK_PERSISTENT_WORKERS` | non | `loader.persistent_workers` du profil fallback | `false` |
+| `LEWM_SIGREG_WEIGHT` | non | Override Hydra `loss.sigreg.weight` | `0.05` |
+| `LEWM_EVAL_EVERY_N_EPOCHS` | non | Override Hydra `trainer.check_val_every_n_epoch` | `10` |
+| `LEWM_PUSH_CHECKPOINT_ON_EVAL` | non | Push HF synchrone à chaque éval | `true` |
+| `LEWM_HF_CHECKPOINT_LAYOUT` | non | Layout HF: `transformers`, `epochs`, `flat` | `transformers` |
 | `LEWM_EXTRA_OVERRIDES` | non | Liste CSV d'overrides Hydra supplémentaires injectés tels quels | `trainer.max_epochs=20,optimizer.lr=1e-4` |
 
 ### Dataset Hydra runtime
 
 | Variable | Obligatoire | Rôle | Exemple |
 | --- | --- | --- | --- |
-| `LEWM_DATASET_NAME` | souvent oui | Nom du dataset attendu par `le-wm`, donc le stem du `.h5` sans extension | `train__observation_images_laptop` |
-| `LEWM_DATA_CONFIG_NAME` | non | Nom du fichier YAML généré dans `src/config/train/data/` | `train__observation_images_laptop` |
-| `LEWM_FRAME_SKIP` | non | Valeur injectée dans la config Hydra dataset | `5` |
+| `LEWM_DATASET_NAMES` | non | Liste CSV de datasets à fusionner dans un seul run | `train__observation_images_laptop,train__observation_images_phone` |
+| `LEWM_DATASET_NAME` | non | Mode mono-dataset rétrocompatible | `train__observation_images_laptop` |
+| `LEWM_DATA_CONFIG_NAME` | non | Nom du YAML généré dans `src/config/train/data/` | `train__observation_images_merged` |
+| `LEWM_FRAME_SKIP` | non | Valeur injectée dans la config Hydra dataset | `10` |
 | `LEWM_KEYS_TO_LOAD` | non | Colonnes HDF5 chargées | `pixels,action,proprio,state` |
 | `LEWM_KEYS_TO_CACHE` | non | Colonnes gardées en cache côté dataset | `action,proprio,state` |
 
@@ -266,12 +278,17 @@ Le wrapper lance `src/train.py` avec au minimum:
 
 ```bash
 python src/train.py \
-  data=train__observation_images_laptop \
+  data=train__observation_images_merged \
   subdir=<RUN_SUBDIR> \
   output_model_name=lewm \
-  loader.batch_size=64 \
-  loader.num_workers=16 \
-  trainer.precision=bf16
+  loader.batch_size=128 \
+  loader.num_workers=8 \
+  loader.prefetch_factor=2 \
+  loader.persistent_workers=true \
+  trainer.precision=bf16 \
+  trainer.check_val_every_n_epoch=10 \
+  checkpoint.object_epoch_interval=10 \
+  loss.sigreg.weight=0.05
 ```
 
 Puis, si WandB est activé, il ajoute aussi:
@@ -296,30 +313,31 @@ Dans `STABLEWM_HOME/<RUN_SUBDIR>/`, tu peux retrouver:
 Si `HF_OUTPUT_REPO_ID` est défini, ces fichiers sont uploadés sous:
 
 ```text
-<HF_OUTPUT_REPO_ID>/<RUN_SUBDIR>/...
+<HF_OUTPUT_REPO_ID>/<RUN_SUBDIR>/checkpoints/checkpoint-00010/...
 ```
 
 ## Recommandations GPU cloud
 
 - H100 / 4090: `--shm-size=16g`
-- Monte `LEWM_NUM_WORKERS` à `16` ou `32` si le CPU suit
+- Ajuste `LEWM_NUM_WORKERS` entre `4` et `12` selon le CPU, puis monte seulement si le GPU reste sous-utilisé
 - Monte un volume persistant sur `/workspace/data` pour éviter de re-télécharger les `.h5` à chaque run
+- Si tu vois `Training failed with exit code -9`, c'est généralement un kill mémoire côté host: baisse `LEWM_NUM_WORKERS` et/ou garde le fallback agressif (`LEWM_FALLBACK_NUM_WORKERS=2`, `LEWM_FALLBACK_PREFETCH_FACTOR=1`)
 - Évite `HF_UPLOAD_ALL_CHECKPOINTS=true` sur les longs runs sauf si tu veux explicitement archiver tous les epochs
 
 ## Dépannage rapide
 
 ### Le wrapper me dit qu'il ne sait pas quel dataset utiliser
 
-Définis explicitement:
+Définis explicitement le mode multi-datasets:
 
 ```dotenv
-LEWM_DATASET_NAME=train__observation_images_laptop
+LEWM_DATASET_NAMES=train__observation_images_laptop,train__observation_images_phone
 ```
 
-Ce nom doit correspondre au nom du fichier local sans extension:
+En mono-dataset (mode rétrocompatible):
 
 ```text
-/workspace/data/train__observation_images_laptop.h5
+LEWM_DATASET_NAME=train__observation_images_laptop
 ```
 
 ### Le wrapper télécharge trop de fichiers
