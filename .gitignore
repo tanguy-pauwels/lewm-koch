@@ -8,3 +8,4 @@ data/
 eval_artifacts/
 *.ckpt
 main.log
+.DS_Store

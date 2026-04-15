@@ -218,6 +218,126 @@ def resolve_checkpoint(cfg: DictConfig) -> Path:
     return ckpt
 
 
+def _load_training_cfg_for_weights(
+    checkpoint_path: Path,
+    cfg: DictConfig,
+) -> DictConfig:
+    local_candidates = [
+        checkpoint_path.parent / "config.yaml",
+        checkpoint_path.parent.parent / "config.yaml",
+        checkpoint_path.parent.parent.parent / "config.yaml",
+    ]
+    for candidate in local_candidates:
+        if candidate.exists() and candidate.is_file():
+            print(f"[checkpoint] using training config: {candidate}")
+            return OmegaConf.load(candidate)
+
+    repo_id = cfg.checkpoint.get("repo_id")
+    run_id = str(cfg.checkpoint.get("run_id") or "").strip("/")
+    if not repo_id or not run_id:
+        raise RuntimeError(
+            "Weights checkpoint detected but no local config.yaml found. "
+            "Set checkpoint.repo_id and checkpoint.run_id so eval can download config.yaml, "
+            "or provide checkpoint.path to an *_object.ckpt file."
+        )
+
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+    api = HfApi(token=token)
+    files = api.list_repo_files(repo_id=repo_id, repo_type="model")
+    prefix = f"{run_id}/"
+    remote_cfgs = [
+        path
+        for path in files
+        if path.startswith(prefix) and Path(path).name == "config.yaml"
+    ]
+    if not remote_cfgs:
+        raise RuntimeError(
+            f"Weights checkpoint detected but no config.yaml found under {repo_id}:{run_id}/"
+        )
+
+    remote_cfg = sorted(remote_cfgs)[-1]
+    local_cfg = hf_hub_download(
+        repo_id=repo_id,
+        repo_type="model",
+        filename=remote_cfg,
+        local_dir=Path(cfg.checkpoint.local_dir).expanduser().resolve(),
+        token=token,
+    )
+    print(f"[checkpoint] downloaded training config: {local_cfg}")
+    return OmegaConf.load(local_cfg)
+
+
+def _build_jepa_model_from_cfg(train_cfg: DictConfig) -> torch.nn.Module:
+    try:
+        import stable_pretraining as spt
+        from jepa import JEPA
+        from module import ARPredictor, Embedder, MLP
+    except ImportError as exc:
+        raise RuntimeError(
+            "Unable to import training modules needed to load weights checkpoint."
+        ) from exc
+
+    encoder = spt.backbone.utils.vit_hf(
+        str(train_cfg.encoder_scale),
+        patch_size=int(train_cfg.patch_size),
+        image_size=int(train_cfg.img_size),
+        pretrained=False,
+        use_mask_token=False,
+    )
+    hidden_dim = int(encoder.config.hidden_size)
+    embed_dim = int(train_cfg.wm.get("embed_dim", hidden_dim))
+    effective_act_dim = int(train_cfg.data.dataset.frameskip) * int(train_cfg.wm.action_dim)
+
+    predictor_cfg = OmegaConf.to_container(train_cfg.predictor, resolve=True)
+    if not isinstance(predictor_cfg, dict):
+        raise RuntimeError("Unexpected predictor config format in training config.")
+
+    predictor = ARPredictor(
+        num_frames=int(train_cfg.wm.history_size),
+        input_dim=embed_dim,
+        hidden_dim=hidden_dim,
+        output_dim=hidden_dim,
+        **predictor_cfg,
+    )
+    action_encoder = Embedder(input_dim=effective_act_dim, emb_dim=embed_dim)
+    projector = MLP(
+        input_dim=hidden_dim,
+        output_dim=embed_dim,
+        hidden_dim=2048,
+        norm_fn=torch.nn.BatchNorm1d,
+    )
+    predictor_proj = MLP(
+        input_dim=hidden_dim,
+        output_dim=embed_dim,
+        hidden_dim=2048,
+        norm_fn=torch.nn.BatchNorm1d,
+    )
+
+    return JEPA(
+        encoder=encoder,
+        predictor=predictor,
+        action_encoder=action_encoder,
+        projector=projector,
+        pred_proj=predictor_proj,
+    )
+
+
+def _extract_model_state_dict(checkpoint_obj: Any) -> dict[str, Any]:
+    if not isinstance(checkpoint_obj, dict):
+        raise RuntimeError("Unsupported checkpoint payload format for weights checkpoint.")
+
+    state_dict = checkpoint_obj.get("state_dict")
+    if state_dict is None and all(isinstance(k, str) for k in checkpoint_obj.keys()):
+        state_dict = checkpoint_obj
+    if not isinstance(state_dict, dict):
+        raise RuntimeError("Weights checkpoint is missing a usable state_dict.")
+
+    model_prefixed = {k[len("model.") :]: v for k, v in state_dict.items() if k.startswith("model.")}
+    if model_prefixed:
+        return model_prefixed
+    return state_dict
+
+
 def load_dataset(cfg: DictConfig):
     dataset = swm.data.HDF5Dataset(
         name=cfg.dataset.name,
@@ -1081,16 +1201,39 @@ def save_optional_extraction_table(cfg: DictConfig, bundle: dict[str, Any], arti
     metadata.to_csv(artifact_dir / "latent_extraction.csv", index=False)
 
 
-def load_checkpoint_model(path: Path, device: torch.device) -> torch.nn.Module:
+def load_checkpoint_model(path: Path, device: torch.device, cfg: DictConfig) -> torch.nn.Module:
     # PyTorch >=2.6 defaults to weights_only=True, but LeWM object checkpoints
     # contain serialized module objects.
     try:
-        model = torch.load(path, map_location=device, weights_only=False)
+        payload = torch.load(path, map_location=device, weights_only=False)
     except TypeError:
-        model = torch.load(path, map_location=device)
-    if not isinstance(model, torch.nn.Module):
-        raise RuntimeError(f"Checkpoint did not contain a torch.nn.Module: {path}")
-    return model
+        payload = torch.load(path, map_location=device)
+
+    if isinstance(payload, torch.nn.Module):
+        return payload
+
+    # Fallback for lightning/state_dict checkpoints (e.g. *_weights.ckpt).
+    if path.name.endswith("_weights.ckpt"):
+        train_cfg = _load_training_cfg_for_weights(path, cfg)
+        model = _build_jepa_model_from_cfg(train_cfg)
+        state_dict = _extract_model_state_dict(payload)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            raise RuntimeError(
+                f"Weights checkpoint load failed: missing {len(missing)} keys "
+                f"(sample: {missing[:5]})"
+            )
+        if unexpected:
+            print(
+                f"[checkpoint] warning: ignored {len(unexpected)} unexpected weights "
+                f"(sample: {unexpected[:5]})"
+            )
+        return model.to(device)
+
+    raise RuntimeError(
+        f"Checkpoint did not contain a torch.nn.Module: {path}. "
+        "Use an *_object.ckpt or a compatible *_weights.ckpt."
+    )
 
 
 def validate_contract(artifact_dir: Path) -> None:
@@ -1133,7 +1276,7 @@ def run(cfg: DictConfig) -> None:
 
     t0 = time.perf_counter()
     print("[stage] loading checkpoint model")
-    model = load_checkpoint_model(checkpoint_path, device)
+    model = load_checkpoint_model(checkpoint_path, device, cfg)
     print(f"[stage] load model done in {format_duration(time.perf_counter() - t0)}")
 
     t0 = time.perf_counter()
