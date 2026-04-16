@@ -10,6 +10,10 @@ This wrapper keeps upstream `le-wm` code in `src/` and injects cloud-oriented ru
 - upload checkpoints to the Hugging Face Hub
 
 ## Why JEPA for robot arm control (SO_ARM101 / KOCH)
+![JEPA](assets/jepa_architecture.webp)
+Jepa is a self-supervised learning method that learns representations by predicting masked-out parts of an input.
+
+More information [here](https://blog.tanguy-pauwels.fr/jepa-vs-vla-rethinking-robotics).
 
 This project started as a practical way to test LeWM architecture behavior for robot-arm control scenarios, especially on KOCH / SO_ARM101-style data.
 
@@ -27,7 +31,6 @@ Main goals:
 
 ## Stack
 
-- GPU base image: `nvcr.io/nvidia/pytorch:24.02-py3`
 - World model: `lucas-maes/le-wm`
 - Core library: `stable-worldmodel[train,env]`
 - Tracking: Weights & Biases
